@@ -1,10 +1,9 @@
-import socket
+import serial
+import serial.tools.list_ports
 import numpy as np
 import pandas as pd
 import pywt
 from datetime import datetime
-import threading
-import queue
 import os
 import time
 
@@ -15,9 +14,9 @@ import time
 class HolterConfig:
     """Configuración centralizada del sistema Holter"""
     
-    # Red UDP
-    UDP_IP = "192.168.4.101"  # IP de tu PC
-    UDP_PORT = 55000
+    # Serial USB
+    BAUD_RATE = 115200
+    SERIAL_TIMEOUT = 2.0
     
     # Frecuencia de muestreo
     SAMPLE_RATE = 100  # Hz
@@ -25,8 +24,6 @@ class HolterConfig:
     # Procesamiento Wavelet
     WAVELET_TYPE = 'db4'
     DECOMPOSITION_LEVEL = 5
-    WINDOW_SIZE = 500  # muestras (5 segundos a 100Hz)
-    OVERLAP = 250      # 50% overlap
     
     # Detección de movimiento
     ACC_THRESHOLD_PERCENTILE = 75
@@ -43,6 +40,26 @@ class HolterConfig:
         session_folder = os.path.join(HolterConfig.OUTPUT_FOLDER, f"Session_{timestamp}")
         os.makedirs(session_folder, exist_ok=True)
         return session_folder
+    
+    @staticmethod
+    def find_xspace_port():
+        """Encuentra automáticamente el puerto del XSpace"""
+        ports = serial.tools.list_ports.comports()
+        
+        for port in ports:
+            if any(keyword in port.description.upper() for keyword in 
+                   ['USB', 'SERIAL', 'COM', 'CP210', 'CH340', 'UART']):
+                print(f"[INFO] Puerto encontrado: {port.device} - {port.description}")
+                return port.device
+        
+        if ports:
+            print("\n[INFO] Puertos disponibles:")
+            for i, port in enumerate(ports):
+                print(f"  {i+1}. {port.device} - {port.description}")
+            return None
+        else:
+            print("[ERROR] No se encontraron puertos seriales")
+            return None
 
 
 # =============================================================================
@@ -65,10 +82,7 @@ def apply_wavelet_thresholding(coeffs, threshold_value, mode='soft'):
 
 
 def adaptive_wavelet_filter(ecg_signal, motion_mask, wavelet='db4', level=5):
-    """
-    Aplica filtrado wavelet adaptativo basado en detección de movimiento.
-    Versión optimizada para procesamiento en tiempo real.
-    """
+    """Aplica filtrado wavelet adaptativo basado en detección de movimiento"""
     
     # Descomposición wavelet
     coeffs = pywt.wavedec(ecg_signal, wavelet, level=level)
@@ -106,178 +120,234 @@ def adaptive_wavelet_filter(ecg_signal, motion_mask, wavelet='db4', level=5):
 
 
 # =============================================================================
-# CLASE: RECEPTOR UDP
+# CLASE: COMUNICACIÓN SERIAL
 # =============================================================================
 
-class UDPReceiver:
-    """Receptor UDP que captura datos en tiempo real"""
+class XSpaceSerial:
+    """Maneja comunicación con el dispositivo XSpace"""
     
-    def __init__(self, data_queue):
-        self.data_queue = data_queue
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((HolterConfig.UDP_IP, HolterConfig.UDP_PORT))
-        self.sock.settimeout(1.0)
-        self.running = False
+    def __init__(self, port=None):
+        self.port = port
+        self.serial_conn = None
         
-    def start(self):
-        """Inicia la recepción de datos"""
-        self.running = True
-        self.thread = threading.Thread(target=self._receive_loop, daemon=True)
-        self.thread.start()
-        print(f"[UDP] Escuchando en {HolterConfig.UDP_IP}:{HolterConfig.UDP_PORT}")
+    def connect(self):
+        """Conecta al puerto serial"""
+        if self.port is None:
+            self.port = HolterConfig.find_xspace_port()
+            
+        if self.port is None:
+            port_input = input("\n[INPUT] Ingrese el puerto COM (ej: COM3): ").strip()
+            self.port = port_input
+        
+        try:
+            self.serial_conn = serial.Serial(
+                port=self.port,
+                baudrate=HolterConfig.BAUD_RATE,
+                timeout=HolterConfig.SERIAL_TIMEOUT
+            )
+            time.sleep(2)  # Esperar reset del ESP32
+            print(f"[OK] Conectado a {self.port} @ {HolterConfig.BAUD_RATE} baud")
+            return True
+        except Exception as e:
+            print(f"[ERROR] No se pudo conectar a {self.port}: {e}")
+            return False
     
-    def _receive_loop(self):
-        """Loop principal de recepción"""
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(1024)
-                message = data.decode('utf-8').strip()
-                
-                # Ignorar mensajes de sistema
-                if message.startswith("ERROR") or message.startswith("SYSTEM"):
-                    print(f"[SYSTEM] {message}")
-                    continue
-                
-                # Parsear datos: timestamp,ECG_I,ECG_II,ECG_III,AccX,AccY,AccZ,AccMag
-                try:
-                    values = [float(x) for x in message.split(',')]
-                    if len(values) == 8:
-                        self.data_queue.put(values)
-                except ValueError:
-                    print(f"[WARNING] Datos inválidos recibidos: {message}")
-                    
-            except socket.timeout:
+    def read_line(self):
+        """Lee una línea del serial"""
+        try:
+            if self.serial_conn.in_waiting > 0:
+                line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
+                return line
+        except Exception as e:
+            print(f"[ERROR] Error leyendo serial: {e}")
+        return None
+    
+    def send_command(self, command):
+        """Envía un comando al dispositivo"""
+        try:
+            self.serial_conn.write(f"{command}\n".encode())
+            print(f"[CMD] Enviado: {command}")
+        except Exception as e:
+            print(f"[ERROR] Error enviando comando: {e}")
+    
+    def wait_for_system_ready(self):
+        """Espera a que el sistema esté listo"""
+        print("[INFO] Esperando que el dispositivo esté listo...")
+        while True:
+            line = self.read_line()
+            if line:
+                print(f"[DEVICE] {line}")
+                if line == "SYSTEM:READY":
+                    return True
+            time.sleep(0.1)
+    
+    def receive_data_block(self):
+        """Recibe un bloque completo de datos desde el ESP32"""
+        print("\n[INFO] Esperando transferencia de datos...")
+        
+        data_buffer = []
+        num_samples = 0
+        in_transfer = False
+        
+        while True:
+            line = self.read_line()
+            
+            if line is None:
+                time.sleep(0.01)
                 continue
-            except Exception as e:
-                print(f"[ERROR] Error en recepción: {e}")
+            
+            # Mensajes del sistema
+            if line.startswith("SYSTEM:") or line.startswith("ERROR:"):
+                print(f"[DEVICE] {line}")
+                continue
+            
+            # Progreso de captura
+            if line.startswith("PROGRESS:"):
+                print(f"[CAPTURE] {line.replace('PROGRESS:', '')}")
+                continue
+            
+            # Inicio de captura
+            if line == "CAPTURE:START":
+                print("[CAPTURE] Iniciando captura de 15 segundos...")
+                continue
+            
+            # Captura completa
+            if line == "CAPTURE:COMPLETE":
+                print("[CAPTURE] Captura completa. Iniciando transferencia...")
+                continue
+            
+            # Inicio de transferencia
+            if line == "TRANSFER:START":
+                in_transfer = True
+                data_buffer = []
+                print("[TRANSFER] Recibiendo datos...")
+                continue
+            
+            # Número de muestras
+            if line.startswith("TRANSFER:SAMPLES:"):
+                num_samples = int(line.replace("TRANSFER:SAMPLES:", ""))
+                print(f"[TRANSFER] Esperando {num_samples} muestras...")
+                continue
+            
+            # Fin de transferencia
+            if line == "TRANSFER:END":
+                print(f"[TRANSFER] Transferencia completa: {len(data_buffer)} muestras recibidas")
+                return data_buffer
+            
+            # Datos
+            if in_transfer and line.startswith("DATA:"):
+                try:
+                    data_str = line.replace("DATA:", "")
+                    values = [float(x) for x in data_str.split(',')]
+                    
+                    if len(values) == 7:  # timestamp,ECG_I,ECG_II,ECG_III,AccX,AccY,AccZ
+                        data_buffer.append(values)
+                        
+                        # Mostrar progreso cada 100 muestras
+                        if len(data_buffer) % 100 == 0:
+                            print(f"[TRANSFER] Recibidas: {len(data_buffer)}/{num_samples}")
+                    else:
+                        print(f"[WARNING] Línea con formato incorrecto: {len(values)} campos")
+                        
+                except ValueError as e:
+                    print(f"[WARNING] Error parseando datos: {e}")
     
-    def stop(self):
-        """Detiene la recepción"""
-        self.running = False
-        self.sock.close()
+    def close(self):
+        """Cierra la conexión serial"""
+        if self.serial_conn:
+            self.serial_conn.close()
+            print("[INFO] Conexión serial cerrada")
 
 
 # =============================================================================
-# CLASE: PROCESADOR WAVELET EN TIEMPO REAL
+# CLASE: PROCESADOR DE DATOS
 # =============================================================================
 
-class WaveletProcessor:
-    """Procesador de señales ECG con wavelets en tiempo real"""
+class DataProcessor:
+    """Procesa los datos capturados con wavelets"""
     
     def __init__(self, session_folder):
         self.session_folder = session_folder
         
-        # Buffers circulares
-        self.buffer_size = HolterConfig.WINDOW_SIZE + HolterConfig.OVERLAP
-        self.ecg_I_buffer = []
-        self.ecg_II_buffer = []
-        self.ecg_III_buffer = []
-        self.acc_mag_buffer = []
-        self.timestamp_buffer = []
+    def process_data_block(self, data_buffer, block_number):
+        """Procesa un bloque de datos completo"""
         
-        # Variables para guardar
-        self.raw_data_list = []
-        self.filtered_data_list = []
+        if len(data_buffer) == 0:
+            print("[WARNING] No hay datos para procesar")
+            return
         
-        # Umbral de movimiento (se calcula adaptativamente)
-        self.acc_threshold = None
+        print(f"\n{'='*70}")
+        print(f"PROCESANDO BLOQUE #{block_number}")
+        print(f"{'='*70}")
         
-        # Archivos CSV
-        self.raw_csv_path = os.path.join(session_folder, "raw_data.csv")
-        self.filtered_csv_path = os.path.join(session_folder, "filtered_data.csv")
+        # Convertir a DataFrame
+        df = pd.DataFrame(data_buffer, columns=[
+            'timestamp', 'ECG_I', 'ECG_II', 'ECG_III', 'AccX', 'AccY', 'AccZ'
+        ])
         
-        # Crear headers
-        self._initialize_csv_files()
+        print(f"[INFO] Muestras totales: {len(df)}")
+        print(f"[INFO] Duración: {(df['timestamp'].max() - df['timestamp'].min()) / 1000:.2f} segundos")
         
-    def _initialize_csv_files(self):
-        """Inicializa archivos CSV con headers"""
-        raw_header = "timestamp,ECG_I,ECG_II,ECG_III,AccX,AccY,AccZ,AccMag\n"
-        filtered_header = "timestamp,ECG_I_filt,ECG_II_filt,ECG_III_filt\n"
+        # Calcular magnitud de aceleración
+        df['AccMag'] = calculate_acceleration_magnitude(
+            df['AccX'].values, 
+            df['AccY'].values, 
+            df['AccZ'].values
+        )
         
-        with open(self.raw_csv_path, 'w') as f:
-            f.write(raw_header)
-        
-        with open(self.filtered_csv_path, 'w') as f:
-            f.write(filtered_header)
-        
-        print(f"[SAVE] Archivos inicializados:")
-        print(f"  - {self.raw_csv_path}")
-        print(f"  - {self.filtered_csv_path}")
-    
-    def process_sample(self, data):
-        """
-        Procesa una muestra individual.
-        data = [timestamp, ECG_I, ECG_II, ECG_III, AccX, AccY, AccZ, AccMag]
-        """
-        
-        # Guardar datos crudos INMEDIATAMENTE
-        self._save_raw_sample(data)
-        
-        # Agregar a buffers
-        timestamp, ecg_I, ecg_II, ecg_III, acc_x, acc_y, acc_z, acc_mag = data
-        
-        self.timestamp_buffer.append(timestamp)
-        self.ecg_I_buffer.append(ecg_I)
-        self.ecg_II_buffer.append(ecg_II)
-        self.ecg_III_buffer.append(ecg_III)
-        self.acc_mag_buffer.append(acc_mag)
-        
-        # Si buffer está lleno, procesar
-        if len(self.ecg_I_buffer) >= HolterConfig.WINDOW_SIZE:
-            self._process_window()
-            
-            # Deslizar ventana (mantener overlap)
-            self.timestamp_buffer = self.timestamp_buffer[-HolterConfig.OVERLAP:]
-            self.ecg_I_buffer = self.ecg_I_buffer[-HolterConfig.OVERLAP:]
-            self.ecg_II_buffer = self.ecg_II_buffer[-HolterConfig.OVERLAP:]
-            self.ecg_III_buffer = self.ecg_III_buffer[-HolterConfig.OVERLAP:]
-            self.acc_mag_buffer = self.acc_mag_buffer[-HolterConfig.OVERLAP:]
-    
-    def _save_raw_sample(self, data):
-        """Guarda muestra cruda inmediatamente en CSV"""
-        line = ",".join([str(x) for x in data]) + "\n"
-        with open(self.raw_csv_path, 'a') as f:
-            f.write(line)
-    
-    def _process_window(self):
-        """Procesa ventana completa con wavelets"""
-        
-        # Convertir a arrays numpy
-        timestamps = np.array(self.timestamp_buffer)
-        ecg_I = np.array(self.ecg_I_buffer)
-        ecg_II = np.array(self.ecg_II_buffer)
-        ecg_III = np.array(self.ecg_III_buffer)
-        acc_mag = np.array(self.acc_mag_buffer)
-        
-        # Calcular umbral de movimiento adaptativamente
-        if self.acc_threshold is None:
-            self.acc_threshold = np.percentile(acc_mag, HolterConfig.ACC_THRESHOLD_PERCENTILE)
+        # Guardar datos crudos
+        raw_file = os.path.join(self.session_folder, f"block_{block_number:03d}_raw.csv")
+        df.to_csv(raw_file, index=False)
+        print(f"[SAVE] Datos crudos: {raw_file}")
         
         # Detectar movimiento
-        motion_mask = detect_motion_segments(acc_mag, self.acc_threshold)
+        acc_threshold = np.percentile(df['AccMag'].values, HolterConfig.ACC_THRESHOLD_PERCENTILE)
+        motion_mask = detect_motion_segments(df['AccMag'].values, acc_threshold)
+        motion_percentage = np.mean(motion_mask) * 100
+        
+        print(f"[MOTION] Umbral: {acc_threshold:.3f} m/s²")
+        print(f"[MOTION] Porcentaje de movimiento: {motion_percentage:.1f}%")
         
         # Aplicar filtrado wavelet a cada derivación
-        ecg_I_filt = adaptive_wavelet_filter(ecg_I, motion_mask, 
-                                             HolterConfig.WAVELET_TYPE, 
-                                             HolterConfig.DECOMPOSITION_LEVEL)
+        print(f"[WAVELET] Aplicando filtrado adaptativo...")
         
-        ecg_II_filt = adaptive_wavelet_filter(ecg_II, motion_mask,
-                                              HolterConfig.WAVELET_TYPE,
-                                              HolterConfig.DECOMPOSITION_LEVEL)
+        ecg_I_filt = adaptive_wavelet_filter(
+            df['ECG_I'].values, 
+            motion_mask, 
+            HolterConfig.WAVELET_TYPE, 
+            HolterConfig.DECOMPOSITION_LEVEL
+        )
         
-        ecg_III_filt = adaptive_wavelet_filter(ecg_III, motion_mask,
-                                               HolterConfig.WAVELET_TYPE,
-                                               HolterConfig.DECOMPOSITION_LEVEL)
+        ecg_II_filt = adaptive_wavelet_filter(
+            df['ECG_II'].values, 
+            motion_mask,
+            HolterConfig.WAVELET_TYPE, 
+            HolterConfig.DECOMPOSITION_LEVEL
+        )
         
-        # Guardar solo las nuevas muestras (no overlap)
-        n_new_samples = len(timestamps) - HolterConfig.OVERLAP
+        ecg_III_filt = adaptive_wavelet_filter(
+            df['ECG_III'].values, 
+            motion_mask,
+            HolterConfig.WAVELET_TYPE, 
+            HolterConfig.DECOMPOSITION_LEVEL
+        )
         
-        for i in range(n_new_samples):
-            filtered_line = f"{timestamps[i]},{ecg_I_filt[i]},{ecg_II_filt[i]},{ecg_III_filt[i]}\n"
-            with open(self.filtered_csv_path, 'a') as f:
-                f.write(filtered_line)
+        # Crear DataFrame con datos filtrados
+        df_filtered = pd.DataFrame({
+            'timestamp': df['timestamp'],
+            'ECG_I_filt': ecg_I_filt,
+            'ECG_II_filt': ecg_II_filt,
+            'ECG_III_filt': ecg_III_filt,
+            'AccMag': df['AccMag'],
+            'Motion': motion_mask.astype(int)
+        })
         
-        print(f"[WAVELET] Ventana procesada | Movimiento: {np.mean(motion_mask)*100:.1f}% | Muestras: {len(timestamps)}")
+        # Guardar datos filtrados
+        filtered_file = os.path.join(self.session_folder, f"block_{block_number:03d}_filtered.csv")
+        df_filtered.to_csv(filtered_file, index=False)
+        print(f"[SAVE] Datos filtrados: {filtered_file}")
+        
+        print(f"{'='*70}\n")
 
 
 # =============================================================================
@@ -285,83 +355,67 @@ class WaveletProcessor:
 # =============================================================================
 
 class HolterSystem:
-    """Sistema completo Holter con procesamiento híbrido"""
+    """Sistema completo Holter - Modo captura por bloques"""
     
-    def __init__(self):
+    def __init__(self, port=None):
         self.session_folder = HolterConfig.create_session_folder()
-        self.data_queue = queue.Queue()
-        self.receiver = UDPReceiver(self.data_queue)
-        self.processor = WaveletProcessor(self.session_folder)
-        self.running = False
-        self.sample_count = 0
+        self.serial = XSpaceSerial(port)
+        self.processor = DataProcessor(self.session_folder)
+        self.block_count = 0
         
     def start(self):
         """Inicia el sistema Holter"""
         print("="*70)
-        print("SISTEMA HOLTER - INICIO")
+        print("SISTEMA HOLTER - MODO CAPTURA POR BLOQUES")
         print("="*70)
         print(f"Sesión: {self.session_folder}")
         print(f"Configuración:")
+        print(f"  - Duración por captura: 15 segundos")
         print(f"  - Frecuencia de muestreo: {HolterConfig.SAMPLE_RATE} Hz")
         print(f"  - Wavelet: {HolterConfig.WAVELET_TYPE}")
-        print(f"  - Ventana de procesamiento: {HolterConfig.WINDOW_SIZE} muestras")
         print("="*70)
         
-        # Iniciar receptor UDP
-        self.receiver.start()
+        # Conectar al dispositivo
+        if not self.serial.connect():
+            print("[ERROR] No se pudo conectar al dispositivo")
+            return
         
-        # Iniciar procesamiento
-        self.running = True
-        self._processing_loop()
-    
-    def _processing_loop(self):
-        """Loop principal de procesamiento"""
-        print("\n[HOLTER] Esperando datos del XSpaceBio...")
-        print("[HOLTER] Presiona Ctrl+C para detener\n")
+        # Esperar que el sistema esté listo
+        self.serial.wait_for_system_ready()
         
-        start_time = time.time()
-        last_print_time = start_time
+        print("\n[INFO] Sistema listo. Presiona Ctrl+C para detener\n")
         
         try:
-            while self.running:
-                try:
-                    # Obtener dato de la cola (timeout 1 segundo)
-                    data = self.data_queue.get(timeout=1.0)
+            while True:
+                # Recibir bloque de datos (el ESP32 inicia captura automáticamente)
+                data_block = self.serial.receive_data_block()
+                
+                if len(data_block) > 0:
+                    self.block_count += 1
                     
-                    # Procesar muestra
-                    self.processor.process_sample(data)
-                    self.sample_count += 1
+                    # Procesar el bloque
+                    self.processor.process_data_block(data_block, self.block_count)
                     
-                    # Imprimir progreso cada 5 segundos
-                    current_time = time.time()
-                    if current_time - last_print_time >= 5.0:
-                        elapsed = current_time - start_time
-                        rate = self.sample_count / elapsed
-                        print(f"[STATUS] Muestras: {self.sample_count} | "
-                              f"Tiempo: {elapsed:.1f}s | "
-                              f"Tasa: {rate:.1f} Hz")
-                        last_print_time = current_time
-                    
-                except queue.Empty:
-                    continue
+                    # Pedir nueva captura
+                    print("[INFO] Enviando comando para nueva captura...")
+                    self.serial.send_command("START")
+                else:
+                    print("[WARNING] No se recibieron datos")
+                    break
                     
         except KeyboardInterrupt:
-            print("\n[HOLTER] Deteniendo sistema...")
+            print("\n[INFO] Deteniendo sistema...")
             self.stop()
     
     def stop(self):
-        """Detiene el sistema Holter"""
-        self.running = False
-        self.receiver.stop()
+        """Detiene el sistema"""
+        self.serial.close()
         
         print("\n" + "="*70)
         print("SISTEMA HOLTER - FINALIZADO")
         print("="*70)
-        print(f"Total de muestras capturadas: {self.sample_count}")
-        print(f"Duración: {self.sample_count / HolterConfig.SAMPLE_RATE:.2f} segundos")
-        print(f"\nArchivos guardados en:")
-        print(f"  - {self.processor.raw_csv_path}")
-        print(f"  - {self.processor.filtered_csv_path}")
+        print(f"Total de bloques procesados: {self.block_count}")
+        print(f"Archivos guardados en: {self.session_folder}")
         print("="*70)
 
 
@@ -370,5 +424,12 @@ class HolterSystem:
 # =============================================================================
 
 if __name__ == "__main__":
-    holter = HolterSystem()
+    import sys
+    
+    port = None
+    if len(sys.argv) > 1:
+        port = sys.argv[1]
+        print(f"[INFO] Usando puerto: {port}")
+    
+    holter = HolterSystem(port)
     holter.start()
