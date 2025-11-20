@@ -619,7 +619,7 @@ This project was developed for the Instrumentation course at PUCP.
 
 ## 👥 Author
 
-Developed as part of the IoT Holter project - PUCP 2025
+Leon Achata
 
 ## 🔗 References
 
