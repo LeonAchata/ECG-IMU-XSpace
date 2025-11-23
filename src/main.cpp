@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <XSpaceBioV10.h>
+#include <XSpaceV21.h>
 #include <Wire.h>
-#include <Adafruit_ADXL345_U.h>
 #include <SD.h>
 #include <FS.h>
 #include <WiFi.h>
@@ -9,22 +9,23 @@
 #include <PubSubClient.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <time.h>
 #include "aws_config.h"
 
 // ============================================================================
 // OBJETOS PRINCIPALES
 // ============================================================================
 XSpaceBioV10Board MyBioBoard;
-Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+XSpaceV21Board XSBoard;  // Para BMI088
 WiFiClientSecure wifiClient;
 PubSubClient mqttClient(wifiClient);
 
 // ============================================================================
-// CONFIGURACIÓN SISTEMA
+// CONFIGURACIÓN SISTEMA 
 // ============================================================================
-const int CAPTURE_DURATION_SEC = 10;
-const int ECG_SAMPLE_RATE_HZ = 100;
-const int IMU_SAMPLE_RATE_HZ = 100;
+const int CAPTURE_DURATION_SEC = 15;
+const int ECG_SAMPLE_RATE_HZ = 250;  // Aumentado para mejor detección de QRS
+const int IMU_SAMPLE_RATE_HZ = 50;   // Reducido a 50Hz para minimizar I2C
 const unsigned long BAUD_RATE = 115200;
 const unsigned long MAX_ECG_SAMPLES = (unsigned long)ECG_SAMPLE_RATE_HZ * CAPTURE_DURATION_SEC;
 const unsigned long MAX_IMU_SAMPLES = (unsigned long)IMU_SAMPLE_RATE_HZ * CAPTURE_DURATION_SEC;
@@ -53,7 +54,7 @@ SystemState currentState = STATE_INIT;
 // ESTRUCTURA DE ARCHIVO BINARIO
 // ============================================================================
 struct FileHeader {
-  uint32_t magic;              // 0x45434744 = "ECGD" (ECGData)
+  uint32_t magic;              // 0x45434744 = "ECGD"
   uint16_t version;
   uint16_t device_id;
   uint32_t session_id;
@@ -62,7 +63,6 @@ struct FileHeader {
   uint16_t imu_sample_rate;
   uint32_t num_ecg_samples;
   uint32_t num_imu_samples;
-  uint8_t reserved[4];
 } __attribute__((packed));
 
 // Estructura para muestra ECG (int16 en lugar de float)
@@ -72,14 +72,11 @@ struct ECGSample {
   int16_t derivation_III;
 } __attribute__((packed));
 
-// Estructura IMU (6 ejes)
+// Estructura IMU solo acelerómetro
 struct IMUSample {
   int16_t accel_x;
   int16_t accel_y;
   int16_t accel_z;
-  int16_t gyro_x;
-  int16_t gyro_y;
-  int16_t gyro_z;
 } __attribute__((packed));
 
 // ============================================================================
@@ -102,10 +99,11 @@ unsigned long lastIMUSample = 0;
 const unsigned long ECG_INTERVAL_US = 1000000 / ECG_SAMPLE_RATE_HZ;
 const unsigned long IMU_INTERVAL_US = 1000000 / IMU_SAMPLE_RATE_HZ;
 
-// Buffer
-const int BUFFER_SIZE = 512;
+// Buffer optimizado (8KB para ~2.7s de datos)
+const int BUFFER_SIZE = 8192;
 uint8_t writeBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
+unsigned long lastFlush = 0;
 
 // Upload
 String uploadURL = "";
@@ -113,9 +111,29 @@ bool urlReceived = false;
 unsigned long uploadStartTime = 0;
 const unsigned long UPLOAD_TIMEOUT_MS = 30000; // milisegundos
 
+// NTP
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -5 * 3600;  // UTC-5 (Perú)
+const int daylightOffset_sec = 0;
+
 // ============================================================================
 // FUNCIONES WIFI
 // ============================================================================
+void syncTime() {
+  Serial.println("[NTP] Sincronizando hora...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("[WARNING] No se pudo obtener hora NTP");
+    return;
+  }
+  
+  Serial.printf("[NTP] Hora sincronizada: %02d/%02d/%04d %02d:%02d:%02d\n",
+                timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+}
+
 void connectWiFi() {
   Serial.println("\n[WiFi] Conectando a: " + String(WIFI_SSID));
   WiFi.mode(WIFI_STA);
@@ -132,6 +150,7 @@ void connectWiFi() {
     Serial.println("\n[WiFi] Conectado");
     Serial.println("[WiFi] IP: " + WiFi.localIP().toString());
     Serial.println("[WiFi] RSSI: " + String(WiFi.RSSI()) + " dBm");
+    syncTime();  // Sincronizar hora NTP
   } else {
     Serial.println("\n[WiFi] ERROR: No se pudo conectar");
     currentState = STATE_ERROR;
@@ -290,23 +309,7 @@ void requestUploadURL() {
   Serial.println("[DEBUG] Payload: " + String(jsonBuffer));
   Serial.println("[DEBUG] Esperando en: " + String(TOPIC_RESPONSE));
   
-  // Mantener conexión viva antes de verificar estado
   mqttClient.loop();
-  delay(10);
-  
-  Serial.println("[DEBUG] MQTT Estado antes de publicar: " + String(mqttClient.state()));
-  Serial.println("[DEBUG] MQTT Conectado: " + String(mqttClient.connected() ? "SI" : "NO"));
-  
-  // Verificar conexión antes de publicar
-  if (!mqttClient.connected()) {
-    Serial.println("[ERROR] MQTT desconectado antes de publicar");
-    Serial.println("[INFO] Intentando reconectar...");
-    if (!connectMQTT()) {
-      Serial.println("[ERROR] No se pudo reconectar");
-      currentState = STATE_ERROR;
-      return;
-    }
-  }
   
   // Publicar como byte array con longitud explícita
   bool publishResult = mqttClient.publish(TOPIC_REQUEST, (uint8_t*)jsonBuffer, jsonSize);
@@ -341,18 +344,7 @@ void requestUploadURL() {
       currentState = STATE_ERROR;
     }
   } else {
-    Serial.println("[ERROR] No se pudo publicar");
-    Serial.println("[DEBUG] MQTT Estado después de fallar: " + String(mqttClient.state()));
-    Serial.println("[DEBUG] MQTT Conectado: " + String(mqttClient.connected() ? "SI" : "NO"));
-    Serial.println("[DEBUG] Payload size: " + String(jsonSize) + " bytes");
-    
-    // Códigos de estado MQTT:
-    // -4 : MQTT_CONNECTION_TIMEOUT
-    // -3 : MQTT_CONNECTION_LOST
-    // -2 : MQTT_CONNECT_FAILED
-    // -1 : MQTT_DISCONNECTED
-    //  0 : MQTT_CONNECTED
-    
+    Serial.println("[ERROR] No se pudo publicar - Estado: " + String(mqttClient.state()));
     currentState = STATE_ERROR;
   }
 }
@@ -373,43 +365,41 @@ bool uploadToS3() {
   Serial.println("[S3] Archivo: " + currentSessionFile);
   Serial.println("[S3] Tamaño: " + String(fileSize / 1024) + " KB");
   
+  // Leer archivo completo en memoria (es pequeño, ~18KB)
+  uint8_t* fileData = (uint8_t*)malloc(fileSize);
+  if (!fileData) {
+    Serial.println("[ERROR] No hay memoria suficiente");
+    file.close();
+    return false;
+  }
+  
+  Serial.println("[S3] Leyendo archivo...");
+  size_t bytesRead = file.read(fileData, fileSize);
+  file.close();
+  
+  if (bytesRead != fileSize) {
+    Serial.println("[ERROR] Lectura incompleta");
+    free(fileData);
+    return false;
+  }
+  
+  Serial.println("[S3] Conectando a S3...");
   HTTPClient http;
   http.begin(uploadURL);
   http.addHeader("Content-Type", "application/octet-stream");
   http.addHeader("Content-Length", String(fileSize));
+  http.setTimeout(30000);  // 30 segundos timeout
   
   Serial.println("[S3] Enviando datos...");
+  int httpCode = http.PUT(fileData, fileSize);
   
-  // Enviar archivo en chunks
-  WiFiClient* stream = http.getStreamPtr();
-  const size_t chunkSize = 4096;
-  uint8_t buffer[chunkSize];
-  size_t bytesUploaded = 0;
-  unsigned long lastReport = millis();
+  free(fileData);
   
-  http.sendRequest("PUT");
-  
-  while (file.available()) {
-    size_t bytesRead = file.read(buffer, chunkSize);
-    stream->write(buffer, bytesRead);
-    bytesUploaded += bytesRead;
-    
-    // Progreso cada segundo
-    if (millis() - lastReport > 1000) {
-      float progress = (bytesUploaded * 100.0) / fileSize;
-      Serial.printf("[S3] Progreso: %.1f%% (%lu/%lu KB)\n", 
-                    progress, bytesUploaded/1024, fileSize/1024);
-      lastReport = millis();
-    }
-  }
-  
-  file.close();
-  
-  int httpCode = http.GET();
-  http.end();
+  Serial.println("[S3] HTTP Code: " + String(httpCode));
   
   if (httpCode == 200 || httpCode == 204) {
     Serial.println("[S3] Upload exitoso!");
+    http.end();
     
     // Borrar archivo de SD
     if (SD.remove(currentSessionFile.c_str())) {
@@ -419,6 +409,9 @@ bool uploadToS3() {
     return true;
   } else {
     Serial.println("[S3] Error HTTP: " + String(httpCode));
+    String response = http.getString();
+    Serial.println("[S3] Response: " + response);
+    http.end();
     return false;
   }
 }
@@ -431,7 +424,20 @@ void stopCapture();
 
 void flushBuffer() {
   if (sdAvailable && bufferIndex > 0 && dataFile) {
-    dataFile.write(writeBuffer, bufferIndex);
+    size_t written = dataFile.write(writeBuffer, bufferIndex);
+    // NO hacer flush aquí - dejarlo para el final
+    
+    static unsigned long totalWritten = 0;
+    totalWritten += written;
+    
+    Serial.printf("[FLUSH] Escribió %d bytes (total: %lu bytes)\n", written, totalWritten);
+    
+    if (written == 0) {
+      Serial.println("[ERROR] Write failed!");
+    } else if (written != bufferIndex) {
+      Serial.printf("[WARNING] Escritura parcial: %d/%d bytes\n", written, bufferIndex);
+    }
+    
     bufferIndex = 0;
   }
 }
@@ -451,13 +457,19 @@ void startCapture() {
   Serial.println("========================================");
   
   captureStartTime = millis();
-  unsigned long timestamp = captureStartTime / 1000;
+  
+  // Obtener timestamp Unix real
+  time_t now;
+  time(&now);
+  unsigned long timestamp = (unsigned long)now;
+  
   currentSessionID = "session_" + String(timestamp);
   currentSessionFile = "/" + currentSessionID + ".bin";
   currentSessionGzFile = "/" + currentSessionID + ".bin.gz";
   
   Serial.println("[INFO] Sesión: " + currentSessionID);
   Serial.println("[INFO] Archivo: " + currentSessionFile);
+  Serial.println("[INFO] Timestamp Unix: " + String(timestamp));
   Serial.printf("[INFO] Duración configurada: %d segundos\n", CAPTURE_DURATION_SEC);
   
   if (!sdAvailable) {
@@ -478,6 +490,8 @@ void startCapture() {
     return;
   }
   
+  Serial.println("[SD] Archivo abierto correctamente");
+  
   if (sdAvailable) {
     FileHeader header = {0};
     header.magic = 0x45434744;  // "ECGD"
@@ -489,11 +503,13 @@ void startCapture() {
     header.imu_sample_rate = IMU_SAMPLE_RATE_HZ;
     
     dataFile.write((uint8_t*)&header, sizeof(FileHeader));
+    dataFile.flush();  // Asegurar que header se escriba
   }
   
   sampleCount = 0;
   imuSampleCount = 0;
   bufferIndex = 0;
+  lastFlush = millis();
   isCapturing = true;
   
   lastECGSample = micros();
@@ -513,61 +529,67 @@ void captureLoop() {
     return;
   }
   
-  // ECG
-  if (currentTime - lastECGSample >= ECG_INTERVAL_US) {
-    lastECGSample = currentTime;
+  // ECG - PRIORIDAD ALTA (debe ejecutarse siempre a tiempo)
+  while (currentTime - lastECGSample >= ECG_INTERVAL_US) {
+    lastECGSample += ECG_INTERVAL_US;
     
     float derivationI = MyBioBoard.AD8232_GetVoltage(AD8232_XS1);
     float derivationII = MyBioBoard.AD8232_GetVoltage(AD8232_XS2);
-    float derivationIII = derivationII - derivationI;
     
-    // Convertir float (mV) a int16 escalado
+    const float OFFSET = 1.65;
+    const float AD8232_GAIN = 1100.0;
+    
+    float ecgI_mV = ((derivationI - OFFSET) * 1000.0) / AD8232_GAIN;
+    float ecgII_mV = ((derivationII - OFFSET) * 1000.0) / AD8232_GAIN;
+    float derivationIII = ecgII_mV - ecgI_mV;
+    
     ECGSample sample;
-    sample.derivation_I = (int16_t)(derivationI * ECG_SCALE_FACTOR);
-    sample.derivation_II = (int16_t)(derivationII * ECG_SCALE_FACTOR);
+    sample.derivation_I = (int16_t)(ecgI_mV * ECG_SCALE_FACTOR);
+    sample.derivation_II = (int16_t)(ecgII_mV * ECG_SCALE_FACTOR);
     sample.derivation_III = (int16_t)(derivationIII * ECG_SCALE_FACTOR);
     
     writeToBuffer((uint8_t*)&sample, sizeof(ECGSample));
-    
     sampleCount++;
+    
+    currentTime = micros();  // Actualizar tiempo
   }
   
-  // IMU
+  // IMU - DESACTIVADO TEMPORALMENTE PARA DEBUG
+  /*
   if (currentTime - lastIMUSample >= IMU_INTERVAL_US) {
-    lastIMUSample = currentTime;
+    lastIMUSample += IMU_INTERVAL_US;
     
-    IMUSample sample;
+    IMUSample sample = {0};
     
     if (imuAvailable) {
-      sensors_event_t event;
-      accel.getEvent(&event);
-      sample.accel_x = (int16_t)(event.acceleration.x * 2048.0 / 9.81);
-      sample.accel_y = (int16_t)(event.acceleration.y * 2048.0 / 9.81);
-      sample.accel_z = (int16_t)(event.acceleration.z * 2048.0 / 9.81);
-    } else {
-      // IMU no disponible - usar valores 0
-      sample.accel_x = 0;
-      sample.accel_y = 0;
-      sample.accel_z = 0;
+      float ax, ay, az;
+      XSBoard.BMI088_GetAccelData(&ax, &ay, &az);
+      
+      sample.accel_x = (int16_t)(ax * 2048.0);
+      sample.accel_y = (int16_t)(ay * 2048.0);
+      sample.accel_z = (int16_t)(az * 2048.0);
     }
     
-    sample.gyro_x = 0;
-    sample.gyro_y = 0;
-    sample.gyro_z = 0;
-    
     writeToBuffer((uint8_t*)&sample, sizeof(IMUSample));
-    
     imuSampleCount++;
   }
+  */
   
-  // Progreso
-  static unsigned long lastReport = 0;
-  if (elapsed > 0 && elapsed % 10 == 0 && elapsed != lastReport) {
-    lastReport = elapsed;
-    float progress = (elapsed * 100.0) / CAPTURE_DURATION_SEC;
-    Serial.printf("[PROGRESS] %lus/%ds (%.1f%%) | ECG: %lu | IMU: %lu\n", 
-                  elapsed, CAPTURE_DURATION_SEC, progress, sampleCount, imuSampleCount);
+  // Flush periódico cada 3 segundos para reducir operaciones SD
+  if (millis() - lastFlush >= 3000) {
+    flushBuffer();
+    lastFlush = millis();
   }
+  
+  // Progreso cada 3 segundos
+  static unsigned long lastReport = 0;
+  if (elapsed > 0 && elapsed % 3 == 0 && elapsed != lastReport) {
+    lastReport = elapsed;
+    Serial.printf("[PROGRESS] %lus/%ds", // | ECG: %lu | IMU: %lu\n
+                  elapsed, CAPTURE_DURATION_SEC, sampleCount, imuSampleCount);
+  }
+  
+  yield();
 }
 
 void stopCapture() {
@@ -590,8 +612,21 @@ void stopCapture() {
     return;
   }
   
+  // CRÍTICO: Flush final del buffer
+  Serial.printf("[DEBUG] Buffer antes de flush: %d bytes\n", bufferIndex);
   flushBuffer();
+  Serial.println("[DEBUG] Buffer flushed");
   
+  // FLUSH ÚNICO al filesystem para escribir todo a SD
+  Serial.println("[DEBUG] Haciendo flush al filesystem...");
+  dataFile.flush();
+  Serial.println("[DEBUG] Flush completado");
+  
+  // Verificar tamaño actual del archivo antes de actualizar header
+  unsigned long currentSize = dataFile.size();
+  Serial.printf("[DEBUG] Tamaño archivo antes de cerrar: %lu bytes\n", currentSize);
+  
+  // Actualizar header con contadores finales
   dataFile.seek(0);
   FileHeader header;
   dataFile.read((uint8_t*)&header, sizeof(FileHeader));
@@ -600,32 +635,51 @@ void stopCapture() {
   
   dataFile.seek(0);
   dataFile.write((uint8_t*)&header, sizeof(FileHeader));
-  dataFile.close();
+  dataFile.flush();
   
+  // Verificar tamaño final
+  unsigned long finalSize = dataFile.size();
+  Serial.printf("[DEBUG] Tamaño archivo después de header: %lu bytes\n", finalSize);
+  
+  dataFile.close();
+  Serial.println("[DEBUG] Archivo cerrado");
+  
+  // Verificar con nueva apertura
   File checkFile = SD.open(currentSessionFile.c_str(), FILE_READ);
+  if (!checkFile) {
+    Serial.println("[ERROR] No se pudo reabrir archivo para verificar");
+    currentState = STATE_ERROR;
+    return;
+  }
+  
   unsigned long fileSize = checkFile.size();
   checkFile.close();
   
   // Calcular tamaño esperado
   unsigned long expectedSize = sizeof(FileHeader) + 
-                               (sampleCount * sizeof(ECGSample)) +
+                               (sampleCount * sizeof(ECGSample)) + 
                                (imuSampleCount * sizeof(IMUSample));
   
   Serial.println("\n========================================");
-  Serial.println("CAPTURA COMPLETADA - FORMATO BINARIO INT16");
+  Serial.println("CAPTURA COMPLETADA");
   Serial.println("========================================");
-  Serial.printf("[INFO] Tamaño: %lu KB (%.2f MB)\n", fileSize/1024, fileSize/(1024.0*1024.0));
-  Serial.printf("[INFO] ECG: %lu muestras x %d bytes = %lu KB\n", 
-                sampleCount, sizeof(ECGSample), (sampleCount * sizeof(ECGSample))/1024);
-  Serial.printf("[INFO] IMU: %lu muestras x %d bytes = %lu KB\n",
-                imuSampleCount, sizeof(IMUSample), (imuSampleCount * sizeof(IMUSample))/1024);
-  Serial.printf("[INFO] Header: %d bytes\n", sizeof(FileHeader));
-  Serial.printf("[VALIDATE] Esperado: %lu bytes | Real: %lu bytes\n", expectedSize, fileSize);
+  Serial.printf("[INFO] Archivo: %lu KB (%.2f MB)\n", fileSize/1024, fileSize/(1024.0*1024.0));
+  Serial.printf("[INFO] ECG: %lu muestras (%.1f Hz)\n", 
+                sampleCount, (float)sampleCount / CAPTURE_DURATION_SEC);
+  Serial.printf("[INFO] IMU: %lu muestras (%.1f Hz)\n",
+                imuSampleCount, (float)imuSampleCount / CAPTURE_DURATION_SEC);
+  Serial.printf("[VERIFY] Esperado: %lu bytes | Real: %lu bytes\n", expectedSize, fileSize);
+  
+  if (fileSize < sizeof(FileHeader)) {
+    Serial.println("[ERROR] Archivo corrupto - solo header o vacío");
+    currentState = STATE_ERROR;
+    return;
+  }
   
   if (fileSize == expectedSize) {
-    Serial.println("[OK] Archivo íntegro - listo para upload");
+    Serial.println("[OK] Archivo completo y válido");
   } else {
-    Serial.println("[WARNING] Discrepancia detectada");
+    Serial.printf("[WARNING] Diferencia: %ld bytes\n", (long)(fileSize - expectedSize));
   }
   Serial.println("========================================\n");
   
@@ -650,13 +704,17 @@ void setup() {
   Serial.println("[OK] XSpaceBio + ECG");
   
   Wire.begin();
-  if(!accel.begin()) {
-    Serial.println("[WARNING] ADXL345 no detectado - usando datos simulados (0)");
+  XSBoard.BMI088_init(16, 17);  // Inicializar BMI088
+  
+  // Probar lectura para verificar si funciona
+  float ax, ay, az;
+  XSBoard.BMI088_GetAccelData(&ax, &ay, &az);
+  
+  if (ax == 0 && ay == 0 && az == 0) {
+    Serial.println("[WARNING] BMI088 no detectado - usando datos simulados (0)");
     imuAvailable = false;
   } else {
-    accel.setRange(ADXL345_RANGE_4_G);
-    accel.setDataRate(ADXL345_DATARATE_100_HZ);
-    Serial.println("[OK] ADXL345");
+    Serial.println("[OK] BMI088");
     imuAvailable = true;
   }
   
