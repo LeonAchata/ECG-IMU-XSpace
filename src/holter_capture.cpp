@@ -314,29 +314,10 @@ void holter_stopCapture() {
   Serial.printf("[DEBUG] Tamaño antes de cerrar: %lu bytes\n", fileSize);
   Serial.printf("[DEBUG] Muestras capturadas: %lu\n", sampleCount);
   
-  // CRÍTICO: Cerrar el archivo ANTES de reabrirlo
-  dataFile.close();
-  Serial.println("[DEBUG] Archivo cerrado");
-  
-  // Esperar un momento para asegurar que el cierre se complete
+  // NO cerrar el archivo, solo hacer seek para actualizar header
+  Serial.println("[DEBUG] Actualizando header sin cerrar archivo...");
   delay(100);
-  
-  // **SOLUCIÓN**: Reabrir en modo FILE_WRITE para actualizar header
-  Serial.println("[DEBUG] Reabriendo archivo para actualizar header...");
-  dataFile = SD.open(currentSessionFile.c_str(), FILE_WRITE);
-  
-  if (!dataFile) {
-    Serial.println("[ERROR] No se pudo reabrir archivo para actualizar header");
-    Serial.println("[WARNING] Los datos están guardados pero el header tiene contadores en 0");
-    return;
-  }
-  
-  // Actualizar SOLO los campos de contadores en el header
-  // Buscar posición de num_ecg_samples en el struct
-  // FileHeader: magic(4) + version(2) + device_id(2) + session_id(4) + timestamp(4) + 
-  //             ecg_rate(2) + imu_rate(2) + num_ecg(4) + num_imu(4)
-  // Offset de num_ecg_samples = 4+2+2+4+4+2+2 = 20 bytes
-  
+
   const size_t OFFSET_NUM_ECG = 20;
   const size_t OFFSET_NUM_IMU = 24;
   
@@ -359,8 +340,6 @@ void holter_stopCapture() {
   }
   
   dataFile.flush();
-  dataFile.close();
-  Serial.println("[DEBUG] Archivo cerrado después de actualizar header");
   
   // Verificación final
   delay(100);
